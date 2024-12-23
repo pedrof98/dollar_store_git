@@ -37,7 +37,7 @@ def main(argv=sys.argv[1:]):
         case "init"         : cmd_init(args)
         case "log"          : cmd_log(args)
         case "ls-files"     : cmd_ls_files(args)
-        case "ls-trees"     : cmd_ls_trees(args)
+        case "ls-tree"     : cmd_ls_tree(args)
         case "rev-parse"    : cmd_rev_parse(args)
         case "rm"           : cmd_rm(args)
         case "show-ref"     : cmd_show_ref(args)
@@ -613,5 +613,156 @@ def log_graphviz(repo, sha, seen):
         p = p.decode("ascii")
         print (" c_{0} -> c_{1};".format(sha, p))
         log_graphviz(repo, p, seen)
+
+
+
+# Reading commit data
+
+
+class GitTreeLeaf(object):
+    def __init__(self, mode, path, sha):
+        self.mode = mode
+        self.path = path
+        self.sha = sha
+
+
+
+"""
+Because a tree object is the repetition of the same fundamental data structure,
+we write the parser in two functions. 
+
+First, a parser to extract a single record, which returns parsed data and the position it reached in input data.
+
+And then, the "real" parser which just calls the previous one in a loop, until input data is exhausted.
+
+"""
+
+def tree_parse_one(raw, start=0):
+    #Find the space terminator of the mode
+    x = raw.find(b' ', start)
+    assert x-start == 5 or x-start==6
+
+    # Read the mode
+    mode = raw[start:x]
+    if len(mode) == 5:
+        # Normalize to six bytes
+        mode = b" " + mode
+
+    # Find the Null terminator of the path
+    y = raw.find(b'\x00', x)
+    # and read the path
+    path = raw[x+1:y]
+
+    # Read the SHA
+    raw_sha = int.from_bytes(raw[y+1:y+21], "big")
+    # and convert it into a hex string, padded to 40 chars
+    # with zeros if needed (in padding)
+    sha = format(raw_sha, "040x")
+    return y+21, GitTreeLeaf(mode, path.decode("utf8"), sha)
+
+
+
+
+def tree_parse(raw):
+    pos = 0
+    max = len(raw)
+    ret = list()
+    while pos < max:
+        pos, data = tree_parse_one(raw, pos)
+        ret.append(data)
+
+    return ret
+
+
+
+"""
+Next we need an ordering function to ensure that when we add or modify entries, they are sorted.
+This is to respect git's identity rules, which states that no two equivalent objects can have a different hash,
+but differently sorted trees with the same contents would be equivalent (describing the same directory structure), 
+and still numerically distinct (different SHA-1 identifiers).
+
+"""
+
+def tree_leaf_sort_key(leaf):
+    if leaf.mode.startswith(b"10"):
+        return leaf.path
+    else: 
+        return leaf.path + "/"
+
+# Next is the serializer that sorts the items using the newly created function as a transformer
+
+def tree_serialize(obj):
+    obj.items.sort(key=tree_leaf_sort_key)
+    ret = b''
+    for i in obj.items:
+        ret += i.mode
+        ret += b' '
+        ret += i.path.encode("utf8")
+        ret += b'\x00'
+        sha = int(i.sha, 16)
+        ret += sha.to_bytes(20, byteorder="big")
+    return ret
+
+# Now lets combine both these functions into the GitTree class
+
+class GitTree(GitObject):
+    fmt=b'tree'
+
+    def deserialize(self, data):
+        self.items = tree_parse(data)
+
+    def serialize(self):
+        return tree_serialize(self)
+
+    def init(self):
+        self.items = list()
+
+
+
+
+# Now onto the ls-tree command.
+# This command simply prints the contents of a tree, recursively with the -r flag
+
+argsp = argsubparsers.add_parser("ls-tree", help="Pretty-print a tree object")
+argsp.add_argument("-r", dest="recursive", action="store_true", help="Recurse into subtrees")
+
+argsp.add_argument("tree", help="A tree-ish object")
+
+def cmd_ls_tree(args):
+    repo = repo_find()
+    ls_tree(repo, args.tree, args.recursive)
+
+
+def ls_tree(repo, ref, recursive=None, prefix=""):
+    sha = object_find(repo, ref, fmt=b"tree")
+    obj = object_read(repo, sha)
+    for item in obj.items:
+        if len(item.mode) == 5:
+            type = item.mode[0:1]
+        else:
+            type = item.mode[0:2]
+
+
+        match type: # Determine the type
+            case b'04': type = "tree"
+            case b'10': type = "blob" # A regular file
+            case b'12': type = "blob" # A symlink. blob contents is link target
+            case b'16': type = "commit" # a submodule
+            case _:
+                raise Exception("Weird tree leaf mode {}".format(item.mode))
+
+        if not (recursive and type=='tree'): # This is a leaf
+            print("{0} {1} {2}\t{3}".format(
+                "0" * (6 - len(item.mode)) + item.mode.decode("ascii"),
+                # Git's ls-tree displays the type
+                # of the object pointed to. Lets do that as well
+                type,
+                item.sha,
+                os.path.join(prefix, item.path)))
+        else: # This is a branch, recurse
+            ls_tree(repo, item.sha, recursive, os.path.join(prefix, item.path))
+
+
+
 
 
