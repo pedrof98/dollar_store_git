@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 
-import libwyag
-libwyag.main()
+"""
+This is the 'wyag' CLI entrypoint
+You can make it executable with 'chmod +x wyag'
+
+
+"""
+
+import sys
+from libwyag.commands import main
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+
 
