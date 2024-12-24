@@ -417,8 +417,36 @@ def cat_file(repo, obj, fmt=None):
 
 
 def object_find(repo, name, fmt=None, follow=True):
-    return name
-#This is just a temporary placeholder
+    sha = object_resolve(repo, name)
+
+    if not sha:
+        raise Exception("No such reference {0}.".format(name))
+
+    if len(sha) > 1:
+        raise Exception("Ambiguous reference {0}: Candidates are:\n - {1}.".format(name, "\n - ".join(sha)))
+
+    sha = sha[0]
+
+    if not fmt:
+        return sha
+
+    while True:
+        obj = object_read(repo, sha)
+        # This is not optimized for performance
+        if obj.fmt == fmt:
+            return sha
+
+        if not follow:
+            return None
+
+        # Follow tags
+        if obj.fmt == b'tag':
+            sha = obj.kvlm[b'object'].decode("ascii")
+        elif obj.fmt == b'commit' and fmt == b'tree':
+            sha = obj.kvlm[b'tree'].decode("ascii")
+        else:
+            return None
+
 
 
 # Hash-object command
@@ -761,6 +789,350 @@ def ls_tree(repo, ref, recursive=None, prefix=""):
                 os.path.join(prefix, item.path)))
         else: # This is a branch, recurse
             ls_tree(repo, item.sha, recursive, os.path.join(prefix, item.path))
+
+
+
+# The checkout command
+
+"""
+This command simply instantiates a commit in the worktree.
+We are going to take in two arguments:
+    - a commit
+    - a directory
+
+After this, the command will then instantiate the tree in the directory, if and only if the directory is empty.
+Git is full of safeguards to avoid deleting data, whoch would be too complicated and unsafe to try and reproduce in wyag.
+Since the point of this project is to demonstrate git, not to produce a working implementation, the limitation is acceptable,
+for now.
+"""
+
+# As usual, we will need a subparser for the command
+
+argsp = argsubparsers.add_parser("checkout", help="Checkout a commit inside of a directory")
+
+argsp.add_argument("commit", help="The commit or tree to checkout")
+
+argsp.add_argument("path", help="The EMPTY directory to checkout on")
+
+# Now let's write the wrapper function for the command
+
+def cmd_checkout(args):
+    repo = repo_find()
+
+    obj = object_read(repo, object_find(repo, args.commit))
+
+    # If the object is a commit, we grab its tree
+    if obj.fmt == b'commit':
+        obj = object_read(repo, obj.kvlm[b'tree'].decode("ascii"))
+
+    # Verify that path is an empty directory
+    if os.path.exists(args.path):
+        if not os.path.isdir(args.path):
+            raise Exception("Not a directory {0}!".format(args.path))
+        if os.listdir(args.path):
+            raise Exception("Not empty {0}!".format(args.path))
+    else:
+        os.makedirs(args.path)
+
+    tree_checkout(repo, obj, os.path.realpath(args.path))
+
+
+# Now the function that does the actual checkout
+
+def tree_checkout(repo, tree, path):
+    for item in tree.items:
+        obj = object_read(repo, item.sha)
+        dest = os.path.join(path, item.path)
+
+        if obj.fmt == b'tree':
+            os.mkdir(dest)
+            tree_checkout(repo, obj, dest)
+        elif obj.fmt == b'blob':
+            # @TODO Support symlinks (identified by mode 12)
+            with open(dest, 'wb') as f:
+                f.write(obj.blobdata)
+
+
+
+
+
+
+
+
+"""
+Git refs:
+    they are inside the subdirectories of .git/refs, and are text files containing a
+    hexadecimal representation of an object's hash, encoded in ASCII
+
+
+To work with refs, we will need a simple recursive solver that will take a ref name as input, 
+follow eventual recursive references and return a SHA-1 identifier
+"""
+
+def ref_resolve(repo, ref):
+    path = repo_file(repo, ref)
+
+    if not os.path.isfile(path):
+        return None
+
+    with open(path, 'r') as fp:
+        data = fp.read()[:-1]
+        # Drop final \n
+    if data.startswith("ref: "):
+        return ref_resolve(repo, data[5:])
+    else:
+        return data
+
+
+
+# The following are two funtions to implement the show-refs command
+
+def ref_list(repo, path=None):
+    if not path:
+        path = repo_dir(repo, "refs")
+    ret = collections.OrderedDict()
+
+    for f in sorted(os.listdir(path)):
+        can = os.path.join(path, f)
+        if os.path.isdir(can):
+            ret[f] = ref_list(repo, can)
+        else:
+            ret[f] = ref_resolve(repo, can)
+
+    return ret
+
+# Next is the subparser, bridge and a recursive worker function to implement this command
+
+argsp = argsubparsers.add_parser("show-ref", help="List references")
+
+def cmd_show_ref(args):
+    repo = repo_find()
+    refs = ref_list(repo)
+    show_ref(repo, refs, prefix="refs")
+
+
+def show_ref(repo, refs, with_hash=True, prefix=""):
+    for k, v in refs.items():
+        if type(v) == str:
+            print ("{0}{1}{2}".format(
+                v + " " if with_hash else "",
+                prefix + "/" if prefix else "",
+                k))
+        else:
+            show_ref(repo, v, with_hash=with_hash, prefix="{0}{1}{2}".format(prefix, "/" if prefix else "". k))
+
+
+
+"""
+The most simple use of refs is tags.
+A tag is a user-defined name for an object, often a commit.
+
+A very common use of tags is to identify software releases:
+    After merging the last commit of a program version you tag it to identify it useing a command like so:
+    " git tag v12.1.1 "commit hash" "
+
+Tagging is like aliasing, in the way that you can now have two ways to refer to the commit, using the tag and its hash.
+
+So, to view the commit you can use both:
+    git checkout "commit hash"
+    and
+    git checkout v12.1.1
+
+
+For a little mor einsight, remember that tags come in two flavors:
+    lightweight tags
+    tags objects
+
+Lightweight tags - regular refs to a commit, a tree or a blob.
+
+Tag objects - regular refs pointing to an object of type tag:
+    Unlike lightweight tags, tag objects have an author, a date, an optional PGP signature and an optional annotation.
+    Their format is the same as a commit object.
+"""
+# Reusing GitCommit and just chanigng the fmt field:
+class GitTag(GitCommit):
+    fmt = b'tag'
+#now we also support tags
+
+
+# The tag command
+
+argsp = argsubparsers.add_parser("tag", help="List and create tags")
+
+argsp.add_argument("-a",
+                    action="store_true",
+                    dest="create_tagobject",
+                    help="Wether to create a tag object")
+
+argsp.add_argument("name", nargs="?", help="The new tag's name")
+
+argsp.add_argument("object",
+                    default="HEAD",
+                    nargs="?",
+                    help="The object the new tag will point to")
+
+
+def cmd_tag(args):
+    repo = repo_find()
+
+    if args.name:
+        tag_create(repo,
+                    args.name,
+                    args.object,
+                    type="object" if args.create_tag_objet else "ref")
+
+    else:
+        refs = ref_list(repo)
+        show_ref(repo, refs["tags"], with_hash=False)
+
+
+def tag_create(repo, name, ref, create_tag_object=False):
+    # get the GitObject from the object referene
+    sha = object_find(repo, ref)
+
+    if create_tag_object:
+        # create tag object (commit)
+        tag = GitTag(repo)
+        tag.kvlm = collections.OrderedDict()
+        tag.kvlm[b'object'] = sha.encode()
+        tag.kvlm[b'type'] = b'commit'
+        tag.kvlm[b'tag'] = name.encode()
+        tag.kvlm[b'tagger'] = b'Wyag <joggabigga@yommomma.com>'
+        tag.kvlm[None] = b"A tag generated by wyag, which won't let you customize the message!"
+        tag_sha = object_write(tag)
+        # create reference
+        ref_create(repo, "tags/" + name, tag_sha)
+    else:
+        # create lightweight tag (ref)
+        ref_create(repo, "tags/" + name, sha)
+
+
+def ref_create(repo, ref_name, sha):
+    with open(repo_file(repo, "refs/" + ref_name), 'w') as fp:
+        fp.write(sha + "\n")
+
+
+
+#Branches
+
+"""
+Simply put:
+    A branch is a reference to a commit.
+
+In this regard, a branch is comparatively the same thing as a tag. As in, tags are refs that live in .git/refs/tags,
+branches are refs that live in .git/refs/heads.
+
+Branches are references to a cmmit, tags can refer to any object
+
+The branch ref is updated at each commit. This means that whenever you commit, Git does this:
+    A new commit object is created, with the current branch's (commit) ID as its parent;
+    The commit object is hashed and stored:
+    The branch ref is updated to refer to the new commit's hash.
+
+
+Note: Detached HEAD:
+    When you checkout a random commit, git will warn you it's in "detached HEAD state".
+    This means you're not on any branch anymore.
+    In this case, .git/HEAD is a direct reference: it contains a SHA-1
+"""
+
+
+# Resolving objects: in case object_find, finds objects with short hashes, these will be resolved to safely return a result 
+# Error is raised if we find more than one correspondence to the short hash
+
+def object_resolve(repo, name):
+    """ Resolve name to an object hash in repo:
+
+    This function will be aware of:
+    - The HEAD literal
+        - short and long hashes
+        - tags
+        - branches
+        - remote branches
+    """
+    candidates = list()
+    hashRE = re.compiler(r"^[0-0A-Fa-f]{4,40}$")
+
+    # Empty string? abort
+    if not name.strip():
+        return None
+
+    # Head is nonambiguous
+    if name == "HEAD":
+        return [ ref_resolve(repo, "HEAD") ]
+
+    # If it's a hex string, try for a hash.
+    if hashRE.match(name):
+        name = name.lower()
+        prefix = name[0:2]
+        path = repo_dir(repo, "objects", prefix, mkdir=False)
+        if path:
+            rem = name[2:]
+            for f in os.listdir(path):
+                if f.startswith(rem):
+                    candidates.append(prefix + f)
+
+    # Try for references
+    as_tag = ref_resolve(repo, "refs/tags/" + name)
+    if as_tag: # was a tag found?
+        candidates.append(as_tag)
+
+
+    as_branch = ref_resolve(repo, "refs/heads/" + name)
+    if as_branch: # was a branch found?
+        candidates.append(as_branch)
+
+    return candidates
+
+
+"""
+Now we need to follow the object we foind to an object of the required type, if a type argument was provided.
+Since we only handle trivial cases, the process is as follows:
+    - if we have a tag and fmt is anything else, we follow the tag
+    - if we have a commit and fmt is tree, we return this commit's tree object
+    - in all other situations, we bail out: no other situation makes sense
+
+    Please check the previously defined function object_find (way above)
+"""
+
+# The rev-parse command
+
+#parser
+argsp = argsubparsers.add_parser("rev-parse", help="Parse revision (or other objects) identifiers")
+
+argsp.add_argument("--wyag-type",
+                    metavar="type",
+                    dest="type",
+                    choices=["blob", "commit", "tag", "tree"],
+                    default=None,
+                    help="Specify the expected type")
+
+argsp.add_argument("name", help="The name to parse")
+
+#Bridge
+
+def cmd_rev_parse(args):
+    if args.type:
+        fmt = args.type.encode()
+    else:
+        fmt = None
+
+    repo = repo_find()
+
+    print (object_find(repo, args.name, fmt, follow=True))
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
